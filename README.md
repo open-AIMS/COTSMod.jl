@@ -106,3 +106,15 @@ see ADRIA's `sandbox/calibration/README.md` for the paired audit and coral plot.
 
 ReefMod 7.0 disease-style die-off. `outbreak_clock` counts consecutive annual steps with post-transition adults `N3 >= collapse_threshold_ha` (default 67.5 COTS/ha = 2.7 per 400 m²); a step below the threshold resets it. When the clock reaches `collapse_duration_years` (default 4), adults are rescaled, keeping age-class proportions, to `min(N3, collapse_background_ha)` (default 0.25 COTS/ha = 0.01 per 400 m²). With `collapse_juveniles = true`, `N2 + N3` together are rescaled. N1, larvae produced that step and external supply are unchanged. Diagnostics: `cots_mechanism_diagnostics` fields `outbreak_clock` and `collapse_removed_ha`. This is phenomenology compatible with a pathogen, not an identified epizootic.
 
+### Post-grazing starvation (`starvation_post_grazing`, default off)
+
+When on, the preferred-prey starvation memory is updated with the preferred cover left after the current adults' per-capita demand, `max(F - N3 * consumption_m2_per_adult_year / (1e4 * habitable_fraction), 0)`, instead of pre-grazing `F`. It requires `per_capita_consumption` and `preferred_prey_starvation` without `prey_switching`. Body condition still uses `F`.
+
+### Starvation grace (`starvation_grace_years`, default 0)
+
+`low_food_years` counts consecutive annual steps with remembered preferred food at or below `starvation_preferred_threshold`; food above the threshold resets it. While `low_food_years <= starvation_grace_years`, the H1 food factor is 1, and the cubic response applies afterwards. 0 reproduces the immediate response. Body condition still follows food. Requires `preferred_prey_starvation` without `diet_linked_starvation`. Diagnostic: `cots_mechanism_diagnostics(...).low_food_years`.
+
+### Forced grazing (`forced_grazing!`)
+
+`forced_grazing!(C_cover_t, adults_ha, prey_map; habitable_fraction, consumption_m2_per_adult_year=10.0)` applies per-capita, preferred-first grazing by a prescribed adult density (COTS per ha of site area, one value per location), without population dynamics. It returns the preferred and non-preferred cover consumed. Its arithmetic equals the `per_capita_consumption` path of `cots_mortality!` (no prey switching, full non-preferred efficiency); a unit test checks this. ADRIA uses it to calibrate coral against observed COTS.
+

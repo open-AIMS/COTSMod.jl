@@ -14,6 +14,7 @@ export AbstractCOTSModel,
     init_cots_populations,
     init_cots_from_spatial,
     cots_mortality!,
+    forced_grazing!,
     disperse_cots_larvae!,
     disperse_cots_larvae_by_reef!,
     inject_upstream_pulse!,
@@ -143,6 +144,15 @@ Base.@kwdef struct COTSParams
     # collapse_threshold_ha (COTS ha^-1), adults (and N2 when collapse_juveniles)
     # are rescaled to collapse_background_ha (COTS ha^-1). ReefMod: 2.7 and 0.01
     # per 400 m^2 = 67.5 and 0.25 COTS ha^-1.
+    # Opt-in post-grazing starvation: preferred-prey starvation memory is updated
+    # with the preferred cover left after the current adults' per-capita demand,
+    # max(F - N3 * c / (1e4 * habitable_fraction), 0), instead of pre-grazing F.
+    # Requires per_capita_consumption and preferred_prey_starvation.
+    starvation_post_grazing::Bool = false
+    # Opt-in starvation grace: preferred-prey starvation applies only after more than
+    # starvation_grace_years consecutive annual steps with remembered preferred food
+    # at or below the threshold (0 reproduces the immediate response).
+    starvation_grace_years::Int = 0
     outbreak_collapse::Bool = false
     collapse_threshold_ha::Float64 = 67.5
     collapse_duration_years::Int = 4
@@ -199,6 +209,8 @@ mutable struct COTSHuman <: AbstractCOTSModel
     outbreak_clock::Int
     # Adults plus (when collapse_juveniles) N2 removed by a collapse (COTS ha^-1).
     last_collapse_removed_ha::Float64
+    # Consecutive years with remembered preferred food at or below the H1 threshold.
+    low_food_years::Int
 end
 
 COTSHuman(N::MVector{3,Float64}, body_condition::Float64, params::COTSParams) =
@@ -212,7 +224,7 @@ COTSHuman(N::MVector{3,Float64}, body_condition::Float64, params::COTSParams) =
         params.adult_senescence ? stable_adult_ages(params, N[3]) : Float64[],
         NaN, 1.0, 0.0, 0.0,
         1.0, 0.0, 1.0,
-        0, 0.0
+        0, 0.0, 0
     )
 
 function _validate_senescence(p::COTSParams)
@@ -248,6 +260,7 @@ function reset_adult_ages!(model::COTSHuman)::Nothing
         stable_adult_ages(model.params, model.N[3]) : Float64[]
     model.preferred_food_memory = NaN
     model.outbreak_clock = 0
+    model.low_food_years = 0
     return nothing
 end
 
@@ -350,6 +363,18 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
         isfinite(p.allee_exponent) && p.allee_exponent > 0.0 ||
             throw(ArgumentError("allee_exponent must be positive"))
     end
+    if p.starvation_grace_years != 0
+        p.starvation_grace_years > 0 ||
+            throw(ArgumentError("starvation_grace_years must be nonnegative"))
+        p.preferred_prey_starvation && !p.diet_linked_starvation ||
+            throw(ArgumentError("starvation_grace_years requires preferred_prey_starvation " *
+                "without diet_linked_starvation"))
+    end
+    if p.starvation_post_grazing
+        p.per_capita_consumption && p.preferred_prey_starvation && !p.prey_switching ||
+            throw(ArgumentError("starvation_post_grazing requires per_capita_consumption " *
+                "and preferred_prey_starvation without prey_switching"))
+    end
     if p.outbreak_collapse
         isfinite(p.collapse_threshold_ha) && p.collapse_threshold_ha > 0.0 ||
             throw(ArgumentError("collapse_threshold_ha must be positive"))
@@ -380,15 +405,19 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
     if p.preferred_prey_starvation
         memory_weight = p.starvation_memory_years > 0.0 ?
             1.0 - exp(-1.0 / p.starvation_memory_years) : 1.0
-        food_memory = isnan(model.preferred_food_memory) ? F :
-            (1.0 - memory_weight) * model.preferred_food_memory + memory_weight * F
+        # Pre-transition adults are those grazing through the coming year.
+        F_food = p.starvation_post_grazing ?
+            max(F - N[3] * p.consumption_m2_per_adult_year / (10_000.0 * habitable_fraction), 0.0) : F
+        food_memory = isnan(model.preferred_food_memory) ? F_food :
+            (1.0 - memory_weight) * model.preferred_food_memory + memory_weight * F_food
         model.preferred_food_memory = food_memory
         threshold = p.starvation_preferred_threshold
         f = if p.diet_linked_starvation
             share = 1.0 / (1.0 + exp(-p.switch_steepness * (food_memory - p.switch_midpoint)))
             (1.0 - p.p_tilde) + p.p_tilde * share
         else
-            food_memory > threshold ? 1.0 :
+            model.low_food_years = food_memory > threshold ? 0 : model.low_food_years + 1
+            food_memory > threshold || model.low_food_years <= p.starvation_grace_years ? 1.0 :
                 (1.0 - p.p_tilde) + p.p_tilde * (food_memory / threshold)^3
         end
     end
@@ -841,6 +870,67 @@ function cots_mortality!(
     return nothing
 end
 
+"""
+    forced_grazing!(C_cover_t, adults_ha, prey_map; habitable_fraction=nothing,
+        consumption_m2_per_adult_year=10.0)
+
+Apply per-capita, preferred-first grazing by a prescribed adult density (COTS per
+ha of site area, one value per location) without any COTS population dynamics. The
+arithmetic matches `per_capita_consumption` with no prey switching and full
+non-preferred efficiency: demand `A * c / (1e4 * k)` (habitable-cover fraction) is
+taken from preferred prey first, the remainder from non-preferred prey, and each
+block loses cover proportionally. Used to force coral calibration with observed
+COTS. Returns the preferred and non-preferred cover consumed per location.
+"""
+function forced_grazing!(
+    C_cover_t::AbstractArray{Float64,3},
+    adults_ha::AbstractVector{<:Real},
+    prey_map::COTSPreyMap;
+    habitable_fraction=nothing,
+    consumption_m2_per_adult_year::Float64=10.0
+)
+    _, n_sizes, n_locs = size(C_cover_t)
+    length(adults_ha) == n_locs ||
+        throw(DimensionMismatch(string(:forced_adults_length_must_match_locations)))
+    isnothing(habitable_fraction) || length(habitable_fraction) == n_locs ||
+        throw(DimensionMismatch(string(:habitable_fraction_length_must_match_locations)))
+    isfinite(consumption_m2_per_adult_year) && consumption_m2_per_adult_year >= 0.0 ||
+        throw(ArgumentError("consumption_m2_per_adult_year must be nonnegative"))
+    consumed_F = zeros(n_locs)
+    consumed_S = zeros(n_locs)
+    @inbounds for loc in 1:n_locs
+        adults = Float64(adults_ha[loc])
+        isfinite(adults) && adults >= 0.0 ||
+            throw(ArgumentError("forced adult density must be finite and nonnegative"))
+        adults == 0.0 && continue
+        F_cover = 0.0
+        for g in prey_map.fast_group_indices, s in 1:n_sizes
+            F_cover += C_cover_t[g, s, loc]
+        end
+        S_cover = 0.0
+        for g in prey_map.slow_group_indices, s in 1:n_sizes
+            S_cover += C_cover_t[g, s, loc]
+        end
+        fraction = isnothing(habitable_fraction) ? 1.0 : Float64(habitable_fraction[loc])
+        fraction = fraction > 0.0 ? min(fraction, 1.0) : 1.0
+        demand = adults * consumption_m2_per_adult_year / (10_000.0 * fraction)
+        Cons_F = min(demand, F_cover)
+        Cons_S = min(demand - Cons_F, S_cover)
+        surv_F = F_cover > 0.0 ? clamp(1.0 - Cons_F / F_cover, 0.0, 1.0) : 1.0
+        surv_S = S_cover > 0.0 ? clamp(1.0 - Cons_S / S_cover, 0.0, 1.0) : 1.0
+        for g in prey_map.fast_group_indices, s in 1:n_sizes
+            C_cover_t[g, s, loc] *= surv_F
+        end
+        for g in prey_map.slow_group_indices, s in 1:n_sizes
+            C_cover_t[g, s, loc] *= surv_S
+        end
+        consumed_F[loc] = Cons_F
+        consumed_S[loc] = Cons_S
+    end
+    clamp!(C_cover_t, 0.0, 1.0)
+    return consumed_F, consumed_S
+end
+
 function inject_upstream_pulse!(cots_models::COTSState, pulse_locs::Set{Int}; pulse_val::Float64=2.0)::Nothing
     for loc in pulse_locs
         if loc <= length(cots_models)
@@ -987,7 +1077,7 @@ plus-group deaths beyond background mortality (COTS ha^-1 yr^-1), and the share
 of per-capita grazing demand aimed at preferred prey (1 without prey switching),
 juvenile predation removals (COTS ha^-1 yr^-1), the juvenile maturation fraction,
 the outbreak clock (consecutive years above the collapse threshold) and COTS
-removed by an outbreak collapse (COTS ha^-1).
+removed by an outbreak collapse (COTS ha^-1), and consecutive low-preferred-food years.
 """
 function cots_mechanism_diagnostics(cots_state::COTSState)
     return (
@@ -999,7 +1089,8 @@ function cots_mechanism_diagnostics(cots_state::COTSState)
         juvenile_predation_ha=[m.last_juvenile_predation_ha for m in cots_state],
         maturation_fraction=[m.last_maturation_fraction for m in cots_state],
         outbreak_clock=[Float64(m.outbreak_clock) for m in cots_state],
-        collapse_removed_ha=[m.last_collapse_removed_ha for m in cots_state]
+        collapse_removed_ha=[m.last_collapse_removed_ha for m in cots_state],
+        low_food_years=[Float64(m.low_food_years) for m in cots_state]
     )
 end
 

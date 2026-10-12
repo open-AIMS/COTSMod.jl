@@ -517,6 +517,91 @@ test_cots_params() = COTSParams(
         @test zero_adults.last_local_fecundity == 0.0
     end
 
+    @testset "forced grazing applies prescribed per-capita preferred-first demand" begin
+        prey = COTSPreyMap([1, 2], [3])
+        cover = zeros(3, 2, 3)
+        cover[1, :, :] .= 0.02
+        cover[2, :, :] .= 0.01
+        cover[3, :, :] .= 0.10
+        original = copy(cover)
+        consumed_F, consumed_S = forced_grazing!(cover, [0.0, 20.0, 100.0], prey;
+            habitable_fraction=[0.5, 0.5, 0.5], consumption_m2_per_adult_year=10.0)
+        @test cover[:, :, 1] == original[:, :, 1]
+        F, S = 0.06, 0.20
+        demand2 = 20.0 * 10.0 / 5_000.0
+        @test consumed_F[2] ≈ demand2
+        @test consumed_S[2] == 0.0
+        @test sum(cover[1:2, :, 2]) ≈ F - demand2
+        @test cover[3, :, 2] == original[3, :, 2]
+        demand3 = 100.0 * 10.0 / 5_000.0
+        @test consumed_F[3] ≈ F
+        @test consumed_S[3] ≈ demand3 - F
+        @test sum(cover[1:2, :, 3]) ≈ 0.0 atol = 1e-15
+        @test sum(cover[3, :, 3]) ≈ S - (demand3 - F)
+        # Same arithmetic as the per-capita path of cots_mortality!: with m3 = 0 and
+        # ample food the post-transition adults equal the forced density.
+        dynamic = copy(original)
+        models = [COTSHuman(MVector{3,Float64}(0.0, 0.0, A), 0.8, COTSParams(IMM=0.0, m3=0.0,
+            per_capita_consumption=true, consumption_m2_per_adult_year=10.0))
+            for A in (0.0, 20.0, 100.0)]
+        cots_mortality!(dynamic, models, prey; habitable_fraction=[0.5, 0.5, 0.5])
+        @test [m.N[3] for m in models] ≈ [0.0, 20.0, 100.0]
+        @test dynamic ≈ cover
+        @test_throws DimensionMismatch forced_grazing!(copy(original), [1.0, 2.0], prey)
+        @test_throws ArgumentError forced_grazing!(copy(original), [1.0, -2.0, 0.0], prey)
+    end
+
+    @testset "starvation grace delays preferred-prey starvation" begin
+        base = (IMM=0.0, p_tilde=0.95, preferred_prey_starvation=true,
+            starvation_memory_years=0.0)
+        initial = MVector{3,Float64}(0.0, 5.0, 20.0)
+        legacy = COTSHuman(copy(initial), 0.8, COTSParams(; base...))
+        zero_grace = COTSHuman(copy(initial), 0.8, COTSParams(; base..., starvation_grace_years=0))
+        graced = COTSHuman(copy(initial), 0.8, COTSParams(; base..., starvation_grace_years=1))
+        f_low = 0.05 + 0.95 * (0.02 / 0.05)^3
+        for (step, F) in enumerate((0.02, 0.02, 0.2, 0.02))
+            cots_timestep!(legacy, F, 0.3)
+            cots_timestep!(zero_grace, F, 0.3)
+            cots_timestep!(graced, F, 0.3)
+            @test zero_grace.N == legacy.N
+            @test zero_grace.last_food_survival == legacy.last_food_survival
+            expected = step in (1, 3, 4) ? 1.0 : f_low
+            @test graced.last_food_survival ≈ expected
+        end
+        @test graced.low_food_years == 1
+        @test cots_mechanism_diagnostics([graced]).low_food_years == [1.0]
+        reset_adult_ages!(graced)
+        @test graced.low_food_years == 0
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(IMM=0.0, starvation_grace_years=1)), 0.1, 0.1)
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(; base..., starvation_grace_years=-1)), 0.1, 0.1)
+    end
+
+    @testset "post-grazing starvation uses preferred cover left after demand" begin
+        initial = MVector{3,Float64}(0.0, 5.0, 60.0)
+        base = (IMM=0.0, p_tilde=0.95, per_capita_consumption=true,
+            consumption_m2_per_adult_year=10.0, preferred_prey_starvation=true,
+            starvation_memory_years=0.0)
+        legacy = COTSHuman(copy(initial), 0.8, COTSParams(; base...))
+        cots_timestep!(legacy, 0.08, 0.3; habitable_fraction=0.6)
+        @test legacy.preferred_food_memory == 0.08
+        @test legacy.last_food_survival == 1.0
+        treated = COTSHuman(copy(initial), 0.8, COTSParams(; base...,
+            starvation_post_grazing=true))
+        cots_timestep!(treated, 0.08, 0.3; habitable_fraction=0.6)
+        left = 0.08 - 60.0 * 10.0 / (10_000.0 * 0.6)
+        @test treated.preferred_food_memory ≈ max(left, 0.0)
+        @test treated.last_food_survival ≈ 0.05 + 0.95 * (max(left, 0.0) / 0.05)^3
+        exhausted = COTSHuman(MVector{3,Float64}(0.0, 0.0, 200.0), 0.8, treated.params)
+        cots_timestep!(exhausted, 0.08, 0.3; habitable_fraction=0.6)
+        @test exhausted.preferred_food_memory == 0.0
+        @test exhausted.last_food_survival ≈ 0.05
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(IMM=0.0, starvation_post_grazing=true,
+                preferred_prey_starvation=true)), 0.1, 0.1)
+    end
+
     @testset "post-outbreak collapse is opt-in, state-triggered and mass-accounted" begin
         initial = MVector{3,Float64}(5.0, 40.0, 200.0)
         base = (IMM=0.0, adult_senescence=true)
