@@ -138,6 +138,16 @@ Base.@kwdef struct COTSParams
     # (CoCoNet form, scale unchanged) instead of A^2 / (allee_threshold^2 + A^2).
     allee_stretched::Bool = false
     allee_exponent::Float64 = 0.5
+    # Opt-in post-outbreak collapse (ReefMod 7.0 disease form): after
+    # collapse_duration_years consecutive years with post-transition adults >=
+    # collapse_threshold_ha (COTS ha^-1), adults (and N2 when collapse_juveniles)
+    # are rescaled to collapse_background_ha (COTS ha^-1). ReefMod: 2.7 and 0.01
+    # per 400 m^2 = 67.5 and 0.25 COTS ha^-1.
+    outbreak_collapse::Bool = false
+    collapse_threshold_ha::Float64 = 67.5
+    collapse_duration_years::Int = 4
+    collapse_background_ha::Float64 = 0.25
+    collapse_juveniles::Bool = false
 end
 
 struct COTSPreyMap
@@ -185,6 +195,10 @@ mutable struct COTSHuman <: AbstractCOTSModel
     last_preferred_diet_share::Float64
     last_juvenile_predation_ha::Float64
     last_maturation_fraction::Float64
+    # Consecutive years with adults at or above collapse_threshold_ha.
+    outbreak_clock::Int
+    # Adults plus (when collapse_juveniles) N2 removed by a collapse (COTS ha^-1).
+    last_collapse_removed_ha::Float64
 end
 
 COTSHuman(N::MVector{3,Float64}, body_condition::Float64, params::COTSParams) =
@@ -197,7 +211,8 @@ COTSHuman(N::MVector{3,Float64}, body_condition::Float64, params::COTSParams) =
         0.0, 0.0, 0.0, 0.0,
         params.adult_senescence ? stable_adult_ages(params, N[3]) : Float64[],
         NaN, 1.0, 0.0, 0.0,
-        1.0, 0.0, 1.0
+        1.0, 0.0, 1.0,
+        0, 0.0
     )
 
 function _validate_senescence(p::COTSParams)
@@ -226,11 +241,13 @@ function stable_adult_ages(p::COTSParams, adults::Float64)::Vector{Float64}
     return max(0.0, adults) .* weights ./ sum(weights)
 end
 
-"""Reset adult age classes and preferred-food memory after `N` is set externally."""
+"""Reset adult age classes, preferred-food memory and the outbreak clock after `N`
+is set externally."""
 function reset_adult_ages!(model::COTSHuman)::Nothing
     model.adult_ages = model.params.adult_senescence ?
         stable_adult_ages(model.params, model.N[3]) : Float64[]
     model.preferred_food_memory = NaN
+    model.outbreak_clock = 0
     return nothing
 end
 
@@ -332,6 +349,15 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
     if p.allee_stretched
         isfinite(p.allee_exponent) && p.allee_exponent > 0.0 ||
             throw(ArgumentError("allee_exponent must be positive"))
+    end
+    if p.outbreak_collapse
+        isfinite(p.collapse_threshold_ha) && p.collapse_threshold_ha > 0.0 ||
+            throw(ArgumentError("collapse_threshold_ha must be positive"))
+        p.collapse_duration_years >= 1 ||
+            throw(ArgumentError("collapse_duration_years must be at least 1"))
+        isfinite(p.collapse_background_ha) &&
+            0.0 <= p.collapse_background_ha < p.collapse_threshold_ha ||
+            throw(ArgumentError("collapse_background_ha must lie in [0, collapse_threshold_ha)"))
     end
 
     F = isnan(F) || isinf(F) ? 0.0 : max(0.0, F)
@@ -503,6 +529,26 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
         all(isfinite, ages) && all(>=(0.0), ages) ||
             throw(ArgumentError("adult age classes became nonfinite or negative"))
         N_next[3] = sum(ages)
+    end
+    model.last_collapse_removed_ha = 0.0
+    if p.outbreak_collapse
+        model.outbreak_clock = N_next[3] >= p.collapse_threshold_ha ?
+            model.outbreak_clock + 1 : 0
+        if model.outbreak_clock >= p.collapse_duration_years
+            # Rescale the dieback classes to the background density, keeping
+            # their proportions (ReefMod f_runmodel reset).
+            dieback = p.collapse_juveniles ? N_next[2] + N_next[3] : N_next[3]
+            scale = dieback > 0.0 ? min(dieback, p.collapse_background_ha) / dieback : 0.0
+            model.last_collapse_removed_ha = dieback * (1.0 - scale)
+            if p.adult_senescence
+                model.adult_ages .*= scale
+                N_next[3] = sum(model.adult_ages)
+            else
+                N_next[3] *= scale
+            end
+            p.collapse_juveniles && (N_next[2] *= scale)
+            model.outbreak_clock = 0
+        end
     end
     model.N .= N_next
     if p.size_weighted_fecundity
@@ -939,7 +985,9 @@ fraction; NaN when the switch is off), realized food survival factor applied to
 N2 and adults, senescent plus-group adults before transition (COTS ha^-1), and
 plus-group deaths beyond background mortality (COTS ha^-1 yr^-1), and the share
 of per-capita grazing demand aimed at preferred prey (1 without prey switching),
-juvenile predation removals (COTS ha^-1 yr^-1) and the juvenile maturation fraction.
+juvenile predation removals (COTS ha^-1 yr^-1), the juvenile maturation fraction,
+the outbreak clock (consecutive years above the collapse threshold) and COTS
+removed by an outbreak collapse (COTS ha^-1).
 """
 function cots_mechanism_diagnostics(cots_state::COTSState)
     return (
@@ -949,7 +997,9 @@ function cots_mechanism_diagnostics(cots_state::COTSState)
         senescent_deaths_ha=[m.last_senescent_deaths_ha for m in cots_state],
         preferred_diet_share=[m.last_preferred_diet_share for m in cots_state],
         juvenile_predation_ha=[m.last_juvenile_predation_ha for m in cots_state],
-        maturation_fraction=[m.last_maturation_fraction for m in cots_state]
+        maturation_fraction=[m.last_maturation_fraction for m in cots_state],
+        outbreak_clock=[Float64(m.outbreak_clock) for m in cots_state],
+        collapse_removed_ha=[m.last_collapse_removed_ha for m in cots_state]
     )
 end
 

@@ -101,3 +101,8 @@ The 1991 Owen size-weighted one-seed screen also failed its qualitative
 peak/trough gate despite reducing effective breeders and local/internal
 recruitment. `size_weighted_fecundity` remains experimental and off by default;
 see ADRIA's `sandbox/calibration/README.md` for the paired audit and coral plot.
+
+### Post-outbreak collapse (`outbreak_collapse`, default off)
+
+ReefMod 7.0 disease-style die-off. `outbreak_clock` counts consecutive annual steps with post-transition adults `N3 >= collapse_threshold_ha` (default 67.5 COTS/ha = 2.7 per 400 m²); a step below the threshold resets it. When the clock reaches `collapse_duration_years` (default 4), adults are rescaled, keeping age-class proportions, to `min(N3, collapse_background_ha)` (default 0.25 COTS/ha = 0.01 per 400 m²). With `collapse_juveniles = true`, `N2 + N3` together are rescaled. N1, larvae produced that step and external supply are unchanged. Diagnostics: `cots_mechanism_diagnostics` fields `outbreak_clock` and `collapse_removed_ha`. This is phenomenology compatible with a pathogen, not an identified epizootic.
+

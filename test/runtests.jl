@@ -517,6 +517,78 @@ test_cots_params() = COTSParams(
         @test zero_adults.last_local_fecundity == 0.0
     end
 
+    @testset "post-outbreak collapse is opt-in, state-triggered and mass-accounted" begin
+        initial = MVector{3,Float64}(5.0, 40.0, 200.0)
+        base = (IMM=0.0, adult_senescence=true)
+        legacy = COTSHuman(copy(initial), 0.8, COTSParams(; base...))
+        off = COTSHuman(copy(initial), 0.8, COTSParams(; base...,
+            collapse_threshold_ha=1.0, collapse_duration_years=1))
+        for model in (legacy, off)
+            reset_adult_ages!(model)
+            cots_timestep!(model, 0.4, 0.1)
+        end
+        @test legacy.N == off.N
+        @test off.outbreak_clock == 0
+        @test off.last_collapse_removed_ha == 0.0
+
+        params(; kwargs...) = COTSParams(; base..., outbreak_collapse=true,
+            collapse_duration_years=2, kwargs...)
+        for juveniles in (false, true)
+            control = COTSHuman(copy(initial), 0.8, COTSParams(; base...))
+            model = COTSHuman(copy(initial), 0.8, params(collapse_juveniles=juveniles))
+            reset_adult_ages!(control)
+            reset_adult_ages!(model)
+            cots_timestep!(control, 0.4, 0.1)
+            cots_timestep!(model, 0.4, 0.1)
+            @test model.N == control.N
+            @test model.outbreak_clock == 1
+            @test model.last_collapse_removed_ha == 0.0
+            cots_timestep!(control, 0.4, 0.1)
+            cots_timestep!(model, 0.4, 0.1)
+            @test control.N[3] >= 67.5
+            dieback = juveniles ? control.N[2] + control.N[3] : control.N[3]
+            scale = 0.25 / dieback
+            @test model.outbreak_clock == 0
+            @test model.last_collapse_removed_ha ≈ dieback - 0.25
+            @test model.N[3] ≈ control.N[3] * scale
+            @test model.N[2] ≈ (juveniles ? control.N[2] * scale : control.N[2])
+            @test model.N[1] == control.N[1]
+            @test sum(model.adult_ages) ≈ model.N[3]
+            @test model.adult_ages ≈ control.adult_ages .* scale
+            @test cots_mechanism_diagnostics([model]).collapse_removed_ha ≈
+                [dieback - 0.25]
+        end
+
+        # A year below the threshold resets the clock, so no collapse occurs.
+        dipping = COTSHuman(MVector{3,Float64}(0.0, 0.0, 150.0), 0.8, params())
+        reset_adult_ages!(dipping)
+        cots_timestep!(dipping, 0.4, 0.1)
+        @test dipping.outbreak_clock == 1
+        dipping.N[3] = 10.0
+        reset_adult_ages!(dipping)
+        @test dipping.outbreak_clock == 0
+        dipping.N[3] = 10.0
+        dipping.outbreak_clock = 1
+        cots_timestep!(dipping, 0.4, 0.1)
+        @test dipping.N[3] < 67.5
+        @test dipping.outbreak_clock == 0
+        @test dipping.last_collapse_removed_ha == 0.0
+
+        # Without senescence the adult total is rescaled directly.
+        plain = COTSHuman(MVector{3,Float64}(0.0, 0.0, 300.0), 0.8, COTSParams(IMM=0.0,
+            outbreak_collapse=true, collapse_duration_years=1))
+        cots_timestep!(plain, 0.4, 0.1)
+        @test plain.N[3] ≈ 0.25
+        @test plain.outbreak_clock == 0
+
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(outbreak_collapse=true, collapse_duration_years=0)), 0.1, 0.1)
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(outbreak_collapse=true, collapse_threshold_ha=0.0)), 0.1, 0.1)
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(outbreak_collapse=true, collapse_background_ha=100.0)), 0.1, 0.1)
+    end
+
     @testset "structural switches replay deterministically" begin
         p = COTSParams(IMM=0.0, preferred_prey_starvation=true,
             starvation_memory_years=0.5, adult_senescence=true)
