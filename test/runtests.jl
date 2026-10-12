@@ -461,6 +461,62 @@ test_cots_params() = COTSParams(
             0.8, COTSParams(nonpreferred_feeding_efficiency=1.5)), 0.1, 0.1)
     end
 
+    @testset "juvenile predator pit, preferred maturation and gradual Allee" begin
+        initial = MVector{3,Float64}(0.0, 10.0, 2.0)
+        legacy = COTSHuman(copy(initial), 0.8, COTSParams(IMM=0.0))
+        off = COTSHuman(copy(initial), 0.8, COTSParams(IMM=0.0,
+            juvenile_predation_capacity=5.0, allee_exponent=2.0))
+        cots_timestep!(legacy, 0.3, 0.1)
+        cots_timestep!(off, 0.3, 0.1)
+        @test legacy.N == off.N
+        @test off.last_juvenile_predation_ha == 0.0
+        @test off.last_maturation_fraction == 1.0
+
+        Q = 20.0
+        pit = COTSHuman(copy(initial), 0.8, COTSParams(IMM=0.0,
+            juvenile_predation=true, juvenile_predation_capacity=Q))
+        cots_timestep!(pit, 0.3, 0.1)
+        J = 10.0 * (1 - pit.params.m2)
+        removed = Q * J / (J + Q)
+        @test pit.last_juvenile_predation_ha ≈ removed
+        @test pit.last_maturation ≈ J - removed
+        @test pit.N[3] ≈ (J - removed) + 2.0 * (1 - pit.params.m3)
+        swamped = COTSHuman(MVector{3,Float64}(0.0, 1000.0, 0.0), 0.8, pit.params)
+        cots_timestep!(swamped, 0.3, 0.1)
+        @test swamped.last_juvenile_predation_ha / (1000.0 * (1 - pit.params.m2)) < 0.03
+
+        p_tilde = 0.95
+        delayed = COTSHuman(copy(initial), 0.8, COTSParams(IMM=0.0, p_tilde=p_tilde,
+            preferred_prey_starvation=true, preferred_maturation=true))
+        cots_timestep!(delayed, 0.04, 0.3)
+        g = sqrt(0.04)
+        f = (1 - p_tilde) + p_tilde * (0.04 / 0.05)^3
+        J = 10.0 * (1 - delayed.params.m2)
+        @test delayed.last_maturation_fraction ≈ g
+        @test delayed.last_maturation ≈ J * g * f
+        @test delayed.N[2] ≈ J * (1 - g)
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(preferred_maturation=true, juvenile_storage=true)), 0.1, 0.1)
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(juvenile_predation=true, juvenile_predation_capacity=0.0)), 0.1, 0.1)
+
+        for A in (1.0, 3.0, 30.0)
+            hill = COTSHuman(MVector{3,Float64}(0.0, 0.0, A), 1.0, COTSParams(IMM=0.0,
+                separated_recruitment=true, larval_fecundity=8.0, allee_threshold=3.0))
+            stretched = COTSHuman(MVector{3,Float64}(0.0, 0.0, A), 1.0, COTSParams(IMM=0.0,
+                separated_recruitment=true, larval_fecundity=8.0, allee_threshold=3.0,
+                allee_stretched=true))
+            cots_timestep!(hill, 0.4, 0.1)
+            cots_timestep!(stretched, 0.4, 0.1)
+            ratio = stretched.last_local_fecundity / hill.last_local_fecundity
+            @test ratio ≈ exp(-(3.0 / A)^0.5) / (A^2 / (9.0 + A^2))
+        end
+        zero_adults = COTSHuman(MVector{3,Float64}(0.0, 0.0, 0.0), 1.0, COTSParams(IMM=0.0,
+            separated_recruitment=true, allee_stretched=true))
+        cots_timestep!(zero_adults, 0.4, 0.1)
+        @test zero_adults.last_local_fecundity == 0.0
+    end
+
     @testset "structural switches replay deterministically" begin
         p = COTSParams(IMM=0.0, preferred_prey_starvation=true,
             starvation_memory_years=0.5, adult_senescence=true)

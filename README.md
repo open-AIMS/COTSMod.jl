@@ -61,6 +61,21 @@ mechanisms are opt-in through `COTSParams`:
   fast prey, with the remainder and any unmet fast demand falling on slow prey
   (MICE-style switching; `F` is a habitable-cover fraction). Experimental: as
   preregistered it sustained high-density COTS on massives;
+- `diet_linked_starvation` (requires `prey_switching` and
+  `preferred_prey_starvation`) sets food survival to
+  `(1-p_tilde) + p_tilde·ρ(F̄)` using the switching logistic on remembered fast
+  cover, as in MICE;
+- `nonpreferred_feeding_efficiency` (default 1) scales the unmet preferred
+  demand that per-capita grazers take from slow prey. With switching, both
+  repairs protect coral but stabilise COTS at a persistent plateau; switching is
+  retained for comparison only;
+- `juvenile_predation` removes `Q·J/(J+Q)` age-1 juveniles per year
+  (`juvenile_predation_capacity = Q`, COTS ha^-1 yr^-1; CoCoNet saturating form);
+- `preferred_maturation` sets the age-1 maturation fraction to `sqrt(F̄)`
+  (remembered fast cover); matured juveniles face the food factor, retained
+  juveniles stay herbivorous and avoid coral starvation (Deaker et al. 2020);
+- `allee_stretched` uses fertilisation `exp(-(allee_threshold/A)^allee_exponent)`
+  (CoCoNet) instead of the Hill form, keeping the same scale;
 - `preferred_condition` drives body condition (the fecundity multiplier) from
   fast cover, `min(1, F/condition_saturation)`, with EMA weight
   `1-exp(-1/condition_memory_years)`, instead of total cover and `tau_condition`;

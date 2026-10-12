@@ -125,6 +125,19 @@ Base.@kwdef struct COTSParams
     # Fraction of unmet preferred demand that per-capita grazers take from
     # non-preferred (slow) prey. 1 preserves the legacy reallocation.
     nonpreferred_feeding_efficiency::Float64 = 1.0
+    # Opt-in saturating predation on age-1 juveniles (CoCoNet benthic-invertebrate
+    # form): predators remove Q*J/(J + Q) COTS ha^-1 yr^-1 from background
+    # survivors J, with capacity Q = juvenile_predation_capacity (COTS ha^-1 yr^-1).
+    juvenile_predation::Bool = false
+    juvenile_predation_capacity::Float64 = 20.0
+    # Opt-in preferred-prey maturation delay: fraction maturing = sqrt(F_memory)
+    # (CoCoNet age-1 -> 2 transition). Matured juveniles face the food factor;
+    # retained juveniles stay herbivorous and are not coral-starved.
+    preferred_maturation::Bool = false
+    # Opt-in gradual Allee fertilisation: exp(-(allee_threshold / A)^allee_exponent)
+    # (CoCoNet form, scale unchanged) instead of A^2 / (allee_threshold^2 + A^2).
+    allee_stretched::Bool = false
+    allee_exponent::Float64 = 0.5
 end
 
 struct COTSPreyMap
@@ -170,6 +183,8 @@ mutable struct COTSHuman <: AbstractCOTSModel
     last_senescent_deaths_ha::Float64
     # Share of grazing demand directed at preferred prey (1 unless prey_switching).
     last_preferred_diet_share::Float64
+    last_juvenile_predation_ha::Float64
+    last_maturation_fraction::Float64
 end
 
 COTSHuman(N::MVector{3,Float64}, body_condition::Float64, params::COTSParams) =
@@ -182,7 +197,7 @@ COTSHuman(N::MVector{3,Float64}, body_condition::Float64, params::COTSParams) =
         0.0, 0.0, 0.0, 0.0,
         params.adult_senescence ? stable_adult_ages(params, N[3]) : Float64[],
         NaN, 1.0, 0.0, 0.0,
-        1.0
+        1.0, 0.0, 1.0
     )
 
 function _validate_senescence(p::COTSParams)
@@ -306,6 +321,18 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
     isfinite(p.nonpreferred_feeding_efficiency) &&
         0.0 <= p.nonpreferred_feeding_efficiency <= 1.0 ||
         throw(ArgumentError("nonpreferred_feeding_efficiency must lie in [0, 1]"))
+    if p.juvenile_predation
+        isfinite(p.juvenile_predation_capacity) && p.juvenile_predation_capacity > 0.0 ||
+            throw(ArgumentError("juvenile_predation_capacity must be positive"))
+    end
+    if p.preferred_maturation
+        !p.juvenile_storage ||
+            throw(ArgumentError("preferred_maturation and juvenile_storage are exclusive"))
+    end
+    if p.allee_stretched
+        isfinite(p.allee_exponent) && p.allee_exponent > 0.0 ||
+            throw(ArgumentError("allee_exponent must be positive"))
+    end
 
     F = isnan(F) || isinf(F) ? 0.0 : max(0.0, F)
     S = isnan(S) || isinf(S) ? 0.0 : max(0.0, S)
@@ -359,7 +386,11 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
     else
         N[3]
     end
-    allee_effect = (N[3]^2) / (p.allee_threshold^2 + N[3]^2)
+    allee_effect = if p.allee_stretched
+        N[3] > 0.0 ? exp(-(p.allee_threshold / N[3])^p.allee_exponent) : 0.0
+    else
+        (N[3]^2) / (p.allee_threshold^2 + N[3]^2)
+    end
     potential_larvae = fecundity * effective_breeders *
         exp(-p.b_ricker * N[3]) * allee_effect
 
@@ -389,9 +420,31 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
     else
         1.0
     end
-    surviving_juveniles = N[2] * (s2 * f)
-    matured_juveniles = surviving_juveniles * maturation_fraction
-    retained_juveniles = surviving_juveniles - matured_juveniles
+    model.last_juvenile_predation_ha = 0.0
+    if p.juvenile_predation || p.preferred_maturation
+        juveniles = N[2] * s2
+        if p.juvenile_predation
+            capacity = p.juvenile_predation_capacity
+            removed = juveniles > 0.0 ? capacity * juveniles / (juveniles + capacity) : 0.0
+            model.last_juvenile_predation_ha = removed
+            juveniles -= removed
+        end
+        if p.preferred_maturation
+            memory = p.preferred_prey_starvation ? model.preferred_food_memory : F
+            maturation_fraction = sqrt(clamp(memory, 0.0, 1.0))
+            matured_juveniles = juveniles * maturation_fraction * f
+            retained_juveniles = juveniles * (1.0 - maturation_fraction)
+        else
+            matured_juveniles = juveniles * f * maturation_fraction
+            retained_juveniles = juveniles * f - matured_juveniles
+        end
+        surviving_juveniles = matured_juveniles + retained_juveniles
+    else
+        surviving_juveniles = N[2] * (s2 * f)
+        matured_juveniles = surviving_juveniles * maturation_fraction
+        retained_juveniles = surviving_juveniles - matured_juveniles
+    end
+    model.last_maturation_fraction = maturation_fraction
 
     model.last_food_survival = f
     model.last_senescent_adults = 0.0
@@ -885,7 +938,8 @@ Food and senescence diagnostics: remembered preferred cover (habitable-area
 fraction; NaN when the switch is off), realized food survival factor applied to
 N2 and adults, senescent plus-group adults before transition (COTS ha^-1), and
 plus-group deaths beyond background mortality (COTS ha^-1 yr^-1), and the share
-of per-capita grazing demand aimed at preferred prey (1 without prey switching).
+of per-capita grazing demand aimed at preferred prey (1 without prey switching),
+juvenile predation removals (COTS ha^-1 yr^-1) and the juvenile maturation fraction.
 """
 function cots_mechanism_diagnostics(cots_state::COTSState)
     return (
@@ -893,7 +947,9 @@ function cots_mechanism_diagnostics(cots_state::COTSState)
         food_survival=[m.last_food_survival for m in cots_state],
         senescent_adults=[m.last_senescent_adults for m in cots_state],
         senescent_deaths_ha=[m.last_senescent_deaths_ha for m in cots_state],
-        preferred_diet_share=[m.last_preferred_diet_share for m in cots_state]
+        preferred_diet_share=[m.last_preferred_diet_share for m in cots_state],
+        juvenile_predation_ha=[m.last_juvenile_predation_ha for m in cots_state],
+        maturation_fraction=[m.last_maturation_fraction for m in cots_state]
     )
 end
 
