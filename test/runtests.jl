@@ -929,4 +929,34 @@ test_cots_params() = COTSParams(
         @test flows.settled_recruits == [0.5, 1.0]
         @test [model.N[1] for model in models] == [0.5, 1.0]
     end
+
+    @testset "observed removals are opt-in, capped and stage-consistent" begin
+        p = COTSParams(adult_senescence=true, size_weighted_fecundity=true)
+        model = COTSHuman(MVector{3,Float64}(5.0, 4.0, 10.0), 1.0, p)
+        before_ages = copy(model.adult_ages)
+        before_large = model.large_adults
+        @test apply_removals!(model, 0.0, 0.0) == (0.0, 0.0)
+        @test model.N == MVector{3,Float64}(5.0, 4.0, 10.0)
+        @test model.adult_ages == before_ages
+        @test apply_removals!(model, 1.5, 2.5) == (1.5, 2.5)
+        @test model.N ≈ [5.0, 2.5, 7.5]
+        @test sum(model.adult_ages) ≈ model.N[3]
+        @test model.adult_ages ≈ before_ages .* 0.75
+        @test model.large_adults ≈ before_large * 0.75
+        # Capped at what is present; recruits untouched.
+        @test apply_removals!(model, 100.0, 100.0) == (2.5, 7.5)
+        @test model.N ≈ [5.0, 0.0, 0.0]
+        @test all(iszero, model.adult_ages) && model.large_adults == 0.0
+        @test apply_removals!(model, 1.0, 1.0) == (0.0, 0.0)
+        @test_throws ArgumentError apply_removals!(model, -1.0, 0.0)
+        @test_throws ArgumentError apply_removals!(model, 0.0, NaN)
+        # Vector form.
+        q = COTSParams()
+        models = [COTSHuman(MVector{3,Float64}(1.0, 2.0, 3.0), 1.0, q),
+                  COTSHuman(MVector{3,Float64}(1.0, 0.5, 0.2), 1.0, q)]
+        removed_j, removed_a = apply_removals!(models, [1.0, 1.0], [0.0, 1.0])
+        @test removed_j == [1.0, 0.5] && removed_a == [0.0, 0.2]
+        @test [m.N[3] for m in models] == [3.0, 0.0]
+        @test_throws DimensionMismatch apply_removals!(models, [1.0], [1.0, 1.0])
+    end
 end

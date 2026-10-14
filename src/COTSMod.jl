@@ -28,7 +28,8 @@ export AbstractCOTSModel,
     cots_hazard_diagnostics,
     cots_mechanism_diagnostics,
     stable_adult_ages,
-    reset_adult_ages!
+    reset_adult_ages!,
+    apply_removals!
 
 abstract type AbstractCOTSModel end
 
@@ -971,6 +972,42 @@ function inject_upstream_pulse!(cots_models::COTSState, pulse_vals::AbstractVect
         cots_models[loc].last_settled_recruits += added
     end
     return nothing
+end
+
+"""
+    apply_removals!(model, juveniles_ha, adults_ha) -> (removed_juveniles_ha, removed_adults_ha)
+
+Opt-in removal of observed culled COTS (COTS ha^-1 of site area). Requests are
+capped at the juveniles (`N[2]`) and adults (`N[3]`) present; recruits (`N[1]`)
+are never removed. Adult age classes and `large_adults` are scaled by the same
+surviving adult fraction so the adult sub-state stays consistent. Nothing in the
+model calls this; the caller chooses when in the annual step it applies.
+"""
+function apply_removals!(model::COTSHuman, juveniles_ha::Real, adults_ha::Real)::Tuple{Float64,Float64}
+    for request in (juveniles_ha, adults_ha)
+        isfinite(request) && request >= 0.0 ||
+            throw(ArgumentError(string(:removal_requests_must_be_finite_and_nonnegative)))
+    end
+    removed_juveniles = min(Float64(juveniles_ha), model.N[2])
+    removed_adults = min(Float64(adults_ha), model.N[3])
+    model.N[2] -= removed_juveniles
+    if removed_adults > 0.0
+        surviving = model.N[3] > 0.0 ? (model.N[3] - removed_adults) / model.N[3] : 0.0
+        model.N[3] -= removed_adults
+        isempty(model.adult_ages) || (model.adult_ages .*= surviving)
+        model.large_adults *= surviving
+    end
+    return removed_juveniles, removed_adults
+end
+
+"""Vector form over locations; returns the removed juveniles and adults per location."""
+function apply_removals!(cots_models::COTSState, juveniles_ha::AbstractVector{<:Real},
+    adults_ha::AbstractVector{<:Real})::Tuple{Vector{Float64},Vector{Float64}}
+    length(juveniles_ha) == length(adults_ha) == length(cots_models) ||
+        throw(DimensionMismatch(string(:removal_vectors_must_match_locations)))
+    removed = [apply_removals!(cots_models[loc], juveniles_ha[loc], adults_ha[loc])
+               for loc in eachindex(cots_models)]
+    return first.(removed), last.(removed)
 end
 
 """
