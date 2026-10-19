@@ -500,6 +500,36 @@ test_cots_params() = COTSParams(
         @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
             COTSParams(juvenile_predation=true, juvenile_predation_capacity=0.0)), 0.1, 0.1)
 
+        # Scarcity-only bank: J*f mature, J*(1 - f) wait in N2, none starve; off replays legacy.
+        for pit_on in (false, true)
+            base = COTSParams(IMM=0.0, p_tilde=p_tilde, preferred_prey_starvation=true,
+                juvenile_predation=pit_on, juvenile_predation_capacity=Q)
+            starving = COTSHuman(copy(initial), 0.8, base)
+            bank = COTSHuman(copy(initial), 0.8, COTSParams(IMM=0.0, p_tilde=p_tilde,
+                preferred_prey_starvation=true, juvenile_predation=pit_on,
+                juvenile_predation_capacity=Q, starvation_bank=true))
+            cots_timestep!(starving, 0.04, 0.3)
+            cots_timestep!(bank, 0.04, 0.3)
+            f = (1 - p_tilde) + p_tilde * (0.04 / 0.05)^3
+            J = 10.0 * (1 - bank.params.m2)
+            J -= pit_on ? Q * J / (J + Q) : 0.0
+            @test bank.last_maturation ≈ J * f
+            @test starving.last_maturation ≈ J * f
+            @test bank.N[2] ≈ J * (1 - f)
+            @test starving.N[2] ≈ 0.0 atol = 1e-12
+            @test bank.N[3] ≈ starving.N[3]
+            @test bank.last_maturation_fraction ≈ f
+        end
+        fed = COTSHuman(copy(initial), 0.8, COTSParams(IMM=0.0, starvation_bank=true))
+        legacy_fed = COTSHuman(copy(initial), 0.8, COTSParams(IMM=0.0))
+        cots_timestep!(fed, 0.3, 0.1)
+        cots_timestep!(legacy_fed, 0.3, 0.1)
+        @test fed.last_food_survival == 1.0 && fed.N ≈ legacy_fed.N   # well fed: no bank
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(starvation_bank=true, preferred_maturation=true)), 0.1, 0.1)
+        @test_throws ArgumentError cots_timestep!(COTSHuman(copy(initial), 0.8,
+            COTSParams(starvation_bank=true, juvenile_storage=true)), 0.1, 0.1)
+
         for A in (1.0, 3.0, 30.0)
             hill = COTSHuman(MVector{3,Float64}(0.0, 0.0, A), 1.0, COTSParams(IMM=0.0,
                 separated_recruitment=true, larval_fecundity=8.0, allee_threshold=3.0))

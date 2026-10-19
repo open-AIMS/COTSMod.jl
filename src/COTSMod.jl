@@ -136,6 +136,9 @@ Base.@kwdef struct COTSParams
     # (CoCoNet age-1 -> 2 transition). Matured juveniles face the food factor;
     # retained juveniles stay herbivorous and are not coral-starved.
     preferred_maturation::Bool = false
+    # Opt-in scarcity-only juvenile bank: of juvenile survivors J, J*f mature (f = food
+    # survival) and J*(1 - f), which would otherwise starve, stay herbivorous in N2.
+    starvation_bank::Bool = false
     # Opt-in gradual Allee fertilisation: exp(-(allee_threshold / A)^allee_exponent)
     # (CoCoNet form, scale unchanged) instead of A^2 / (allee_threshold^2 + A^2).
     allee_stretched::Bool = false
@@ -360,6 +363,10 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
         !p.juvenile_storage ||
             throw(ArgumentError("preferred_maturation and juvenile_storage are exclusive"))
     end
+    if p.starvation_bank
+        !(p.juvenile_storage || p.preferred_maturation) ||
+            throw(ArgumentError("starvation_bank excludes juvenile_storage and preferred_maturation"))
+    end
     if p.allee_stretched
         isfinite(p.allee_exponent) && p.allee_exponent > 0.0 ||
             throw(ArgumentError("allee_exponent must be positive"))
@@ -477,7 +484,7 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
         1.0
     end
     model.last_juvenile_predation_ha = 0.0
-    if p.juvenile_predation || p.preferred_maturation
+    if p.juvenile_predation || p.preferred_maturation || p.starvation_bank
         juveniles = N[2] * s2
         if p.juvenile_predation
             capacity = p.juvenile_predation_capacity
@@ -490,6 +497,10 @@ function cots_timestep!(model::COTSHuman, F::Float64, S::Float64;
             maturation_fraction = sqrt(clamp(memory, 0.0, 1.0))
             matured_juveniles = juveniles * maturation_fraction * f
             retained_juveniles = juveniles * (1.0 - maturation_fraction)
+        elseif p.starvation_bank
+            maturation_fraction = f
+            matured_juveniles = juveniles * f
+            retained_juveniles = juveniles * (1.0 - f)
         else
             matured_juveniles = juveniles * f * maturation_fraction
             retained_juveniles = juveniles * f - matured_juveniles
