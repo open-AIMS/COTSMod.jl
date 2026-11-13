@@ -989,4 +989,37 @@ test_cots_params() = COTSParams(
         @test [m.N[3] for m in models] == [3.0, 0.0]
         @test_throws DimensionMismatch apply_removals!(models, [1.0], [1.0, 1.0])
     end
+
+    @testset "state setter and annual multipliers" begin
+        p = COTSParams(adult_senescence=true, size_weighted_fecundity=true)
+        models = [COTSHuman(MVector{3,Float64}(0.0, 0.0, 1.0), 1.0, p) for _ in 1:2]
+        for m in models
+            m.last_hazard = 0.5
+            m.burden_ha = 2.0
+        end
+        set_cots_state!(models, [1.0 2.0 4.0; 0.0 0.0 0.0])
+        @test models[1].N == MVector{3,Float64}(1.0, 2.0, 4.0)
+        @test models[1].large_adults ≈ 4.0 * p.size_initial_large_fraction
+        @test models[1].last_hazard == 0.0 && models[1].burden_ha == 0.0
+        @test sum(models[1].adult_ages) ≈ 4.0
+        @test models[2].N == MVector{3,Float64}(0.0, 0.0, 0.0)
+        @test_throws DimensionMismatch set_cots_state!(models, zeros(3, 3))
+        @test_throws DimensionMismatch set_cots_state!(models, zeros(2, 2))
+
+        q = COTSParams()
+        models = [COTSHuman(MVector{3,Float64}(1.0, 0.0, 0.0), 1.0, q) for _ in 1:2]
+        for m in models
+            m.last_local_fecundity = 8.0
+            m.last_settlement_gate = 1.0
+            m.last_background_immigration = 3.0
+        end
+        scale_larval_production!(models, [0.5, 0.0])
+        @test [m.last_local_fecundity for m in models] == [4.0, 0.0]
+        scale_settlement!(models, [0.5, 0.25])
+        @test [m.last_settlement_gate for m in models] == [0.5, 0.25]
+        @test [m.N[1] for m in models] == [0.5, 0.25]
+        @test [m.last_background_immigration for m in models] == [1.5, 0.75]
+        @test_throws DimensionMismatch scale_larval_production!(models, [1.0])
+        @test_throws DimensionMismatch scale_settlement!(models, [1.0, 1.0, 1.0])
+    end
 end
