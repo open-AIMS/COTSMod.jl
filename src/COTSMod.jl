@@ -29,7 +29,10 @@ export AbstractCOTSModel,
     cots_mechanism_diagnostics,
     stable_adult_ages,
     reset_adult_ages!,
-    apply_removals!
+    apply_removals!,
+    set_cots_state!,
+    scale_larval_production!,
+    scale_settlement!
 
 abstract type AbstractCOTSModel end
 
@@ -1019,6 +1022,73 @@ function apply_removals!(cots_models::COTSState, juveniles_ha::AbstractVector{<:
     removed = [apply_removals!(cots_models[loc], juveniles_ha[loc], adults_ha[loc])
                for loc in eachindex(cots_models)]
     return first.(removed), last.(removed)
+end
+
+"""
+    set_cots_state!(cots_models::COTSState, state::AbstractMatrix{<:Real})
+
+Set each location's stage densities (COTS ha^-1; columns recruit, juvenile, adult, the
+order of `COTSHuman.N`) from the `locations x 3` matrix `state`, and clear the state
+derived from earlier years (large-adult fraction, hazard and burden diagnostics, adult
+age profile and food memory). Intended for initialising from observed densities before the
+first annual step.
+"""
+function set_cots_state!(cots_models::COTSState, state::AbstractMatrix{<:Real})::Nothing
+    size(state) == (length(cots_models), 3) ||
+        throw(DimensionMismatch(string(:initial_state_must_be_locations_by_3_stages)))
+    for (model, row) in zip(cots_models, eachrow(state))
+        model.N .= row
+        model.large_adults =
+            model.params.size_weighted_fecundity ?
+            row[3] * model.params.size_initial_large_fraction : 0.0
+        model.last_effective_breeders = 0.0
+        model.last_small_adult_growth = 0.0
+        model.burden_ha = 0.0
+        model.last_burden_ha = 0.0
+        model.last_hazard = 0.0
+        model.last_hazard_deaths_ha = 0.0
+        reset_adult_ages!(model)
+    end
+    return nothing
+end
+
+"""
+    scale_larval_production!(cots_models::COTSState, multipliers::AbstractVector{<:Real})
+
+Scale each location's larval production (`last_local_fecundity`, used by separated
+recruitment) by its survival multiplier. Apply at the source, after the annual step and
+before dispersal.
+"""
+function scale_larval_production!(
+    cots_models::COTSState, multipliers::AbstractVector{<:Real}
+)::Nothing
+    length(multipliers) == length(cots_models) ||
+        throw(DimensionMismatch(string(:larval_multipliers_must_match_locations)))
+    for (model, m) in zip(cots_models, multipliers)
+        model.last_local_fecundity *= m
+    end
+    return nothing
+end
+
+"""
+    scale_settlement!(cots_models::COTSState, multipliers::AbstractVector{<:Real})
+
+Scale each location's settlement by its habitat multiplier: the settlement gate (so larvae
+that settle later in the year, local, from other locations or from outside, pass through
+the scaled gate) and the recruits and background immigration already settled this year.
+Apply after the annual step and before dispersal.
+"""
+function scale_settlement!(
+    cots_models::COTSState, multipliers::AbstractVector{<:Real}
+)::Nothing
+    length(multipliers) == length(cots_models) ||
+        throw(DimensionMismatch(string(:settlement_multipliers_must_match_locations)))
+    for (model, m) in zip(cots_models, multipliers)
+        model.last_settlement_gate *= m
+        model.N[1] *= m
+        model.last_background_immigration *= m
+    end
+    return nothing
 end
 
 """
